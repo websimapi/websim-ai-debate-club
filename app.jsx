@@ -1,1 +1,613 @@
-{"content":"const { useState, useEffect, useRef, useSyncExternalStore } = React;\nconst { DateTime } = luxon;\nconst ReactMarkdown = ReactMarkdown.default;\n\n// Initialize WebsimSocket\nconst room = new WebsimSocket();\n\n// Collection Names (consider versioning if schema changes)\nconst DEBATE_COLLECTION = 'debate_v1';\nconst MESSAGE_COLLECTION = 'message_v1';\n\nconst App = () => {\n    const [currentDebateId, setCurrentDebateId] = useState(null);\n    const [loading, setLoading] = useState(false);\n    const [error, setError] = useState(null);\n\n    // Subscribe to the list of debates\n    const debates = useSyncExternalStore(\n        room.collection(DEBATE_COLLECTION).subscribe,\n        room.collection(DEBATE_COLLECTION).getList\n    );\n\n    // Find the most recent debate (getList sorts newest first)\n    useEffect(() => {\n        if (debates.length > 0) {\n            setCurrentDebateId(debates[0].id);\n        } else {\n            setCurrentDebateId(null); // Reset if no debates exist\n        }\n    }, [debates]);\n\n    const handleCreateDebate = async (topic, aiPersona1, aiPersona2) => {\n        setLoading(true);\n        setError(null);\n        try {\n            const newDebate = await room.collection(DEBATE_COLLECTION).create({\n                topic,\n                aiPersona1,\n                aiPersona2,\n                active: true, // Mark the debate as active\n            });\n            setCurrentDebateId(newDebate.id);\n        } catch (err) {\n            console.error(\"Error creating debate:\", err);\n            setError(\"Failed to create debate. Please try again.\");\n        } finally {\n            setLoading(false);\n        }\n    };\n\n    const handleResetDebate = async () => {\n         if (!currentDebateId) return;\n         setLoading(true);\n         try {\n             // Optionally: Mark the current debate as inactive instead of deleting\n             // await room.collection(DEBATE_COLLECTION).update(currentDebateId, { active: false });\n\n             // For simplicity, we'll just reset the state, allowing a new debate setup\n             setCurrentDebateId(null);\n\n             // Note: Messages associated with the old debate ID remain in the DB\n             // but won't be shown unless that specific debate is somehow loaded again.\n             // If full cleanup is needed, messages could be deleted here (carefully!).\n\n         } catch (err) {\n              console.error(\"Error resetting debate:\", err);\n              setError(\"Failed to reset debate state.\");\n         } finally {\n             setLoading(false);\n         }\n    };\n\n    if (loading && !currentDebateId) { // Show loading spinner only during initial setup load\n        return <div className=\"loading\"><div className=\"spinner\"></div></div>;\n    }\n\n    if (error) {\n        return <div className=\"error\">Error: {error} <button onClick={() => setError(null)}>Dismiss</button></div>;\n    }\n\n    return (\n        <div className=\"container\">\n            <h1>AI Debate Club</h1>\n            {!currentDebateId ? (\n                <DebateSetup onCreateDebate={handleCreateDebate} isLoading={loading} />\n            ) : (\n                <DebateInterface\n                    debateId={currentDebateId}\n                    debates={debates} // Pass debates down to find the current one\n                    onResetDebate={handleResetDebate}\n                    isLoading={loading}\n                    setLoading={setLoading}\n                    setError={setError}\n                />\n            )}\n        </div>\n    );\n};\n\nconst DebateSetup = ({ onCreateDebate, isLoading }) => {\n    const [topic, setTopic] = useState('');\n    const [aiPersona1, setAiPersona1] = useState('');\n    const [aiPersona2, setAiPersona2] = useState('');\n\n    const handleSubmit = (e) => {\n        e.preventDefault();\n        if (!topic.trim() || !aiPersona1.trim() || !aiPersona2.trim()) {\n            alert(\"Please fill in all fields.\");\n            return;\n        }\n        onCreateDebate(topic, aiPersona1, aiPersona2);\n    };\n\n    return (\n        <div className=\"debate-setup\">\n            <h2>Start a New Debate</h2>\n            <form onSubmit={handleSubmit}>\n                <div className=\"form-group\">\n                    <label htmlFor=\"topic\">Debate Topic:</label>\n                    <input\n                        type=\"text\"\n                        id=\"topic\"\n                        value={topic}\n                        onChange={(e) => setTopic(e.target.value)}\n                        placeholder=\"e.g., Is pineapple on pizza delicious?\"\n                        required\n                        disabled={isLoading}\n                    />\n                </div>\n                <div className=\"form-group\">\n                    <label htmlFor=\"aiPersona1\">AI Persona 1 (Proponent):</label>\n                    <textarea\n                        id=\"aiPersona1\"\n                        value={aiPersona1}\n                        onChange={(e) => setAiPersona1(e.target.value)}\n                        placeholder=\"e.g., A passionate Italian chef defending traditional pizza.\"\n                        required\n                        disabled={isLoading}\n                    />\n                </div>\n                <div className=\"form-group\">\n                    <label htmlFor=\"aiPersona2\">AI Persona 2 (Opponent):</label>\n                    <textarea\n                        id=\"aiPersona2\"\n                        value={aiPersona2}\n                        onChange={(e) => setAiPersona2(e.target.value)}\n                        placeholder=\"e.g., An adventurous food blogger who loves experimenting.\"\n                        required\n                        disabled={isLoading}\n                    />\n                </div>\n                <button type=\"submit\" className=\"button\" disabled={isLoading}>\n                    {isLoading ? 'Starting...' : 'Start Debate'}\n                </button>\n            </form>\n        </div>\n    );\n};\n\nconst DebateInterface = ({ debateId, debates, onResetDebate, isLoading, setLoading, setError }) => {\n    const [newMessage, setNewMessage] = useState('');\n    const messagesEndRef = useRef(null);\n    const textareaRef = useRef(null);\n\n    // Filter object memoization is crucial for useSyncExternalStore\n    const messageFilter = useRef({ debate_id: debateId }).current;\n    messageFilter.debate_id = debateId; // Update if debateId changes, though usually it won't in this component instance\n\n    // Subscribe to messages for the current debate\n    const messages = useSyncExternalStore(\n        (callback) => room.collection(MESSAGE_COLLECTION).filter(messageFilter).subscribe(callback),\n        () => room.collection(MESSAGE_COLLECTION).filter(messageFilter).getList(),\n        [debateId] // Dependency array helps React re-subscribe if debateId changes\n    );\n\n    // Find the current debate details\n    const currentDebate = debates.find(d => d.id === debateId);\n\n    useEffect(() => {\n        // Auto-scroll to the bottom\n        messagesEndRef.current?.scrollIntoView({ behavior: \"smooth\" });\n    }, [messages]);\n\n    // Auto-resize textarea\n     useEffect(() => {\n        const textarea = textareaRef.current;\n        if (textarea) {\n            textarea.style.height = 'auto'; // Reset height\n            textarea.style.height = `${textarea.scrollHeight}px`; // Set to scroll height\n        }\n    }, [newMessage]);\n\n\n    const handleSendMessage = async (e) => {\n        e.preventDefault();\n        if (!newMessage.trim() || isLoading) return;\n\n        const userMessageContent = newMessage.trim();\n        setNewMessage(''); // Clear input immediately\n        setLoading(true);\n        setError(null);\n\n        try {\n            // 1. Create user message record\n            const userMessage = await room.collection(MESSAGE_COLLECTION).create({\n                debate_id: debateId,\n                role: 'user',\n                content: userMessageContent,\n            });\n\n            // 2. Prepare history for LLM (newest messages first, limit history)\n            const recentMessages = room.collection(MESSAGE_COLLECTION)\n                                     .filter({ debate_id: debateId })\n                                     .getList() // Get latest snapshot\n                                     .slice(0, 10) // Limit history\n                                     .reverse() // Oldest first for LLM context\n                                     .map(msg => ({ role: msg.role, content: msg.content }));\n\n            // Determine which AI's turn it is (simple alternation based on last AI message)\n            const lastAiMessage = recentMessages.slice().reverse().find(m => m.role.startsWith('ai_'));\n            const nextAiRole = (!lastAiMessage || lastAiMessage.role === 'ai_2') ? 'ai_1' : 'ai_2';\n            const nextAiPersona = nextAiRole === 'ai_1' ? currentDebate.aiPersona1 : currentDebate.aiPersona2;\n            const opponentPersona = nextAiRole === 'ai_1' ? currentDebate.aiPersona2 : currentDebate.aiPersona1;\n\n            // 3. Call LLM for AI response\n            const systemPrompt = `You are participating in a debate on the topic: \"${currentDebate.topic}\".\nYour persona is: \"${nextAiPersona}\".\nYour opponent's persona is: \"${opponentPersona}\".\nRespond concisely and stay in character. Address the previous points made. Use Markdown for formatting.`;\n\n            const completion = await websim.chat.completions.create({\n                messages: [\n                    { role: \"system\", content: systemPrompt },\n                    ...recentMessages,\n                     // Add the user's *latest* message explicitly if not already in getList snapshot\n                    ...(recentMessages.length === 0 || recentMessages[recentMessages.length - 1].content !== userMessageContent\n                       ? [{ role: \"user\", content: userMessageContent }] : [])\n                ],\n            });\n\n            const aiResponseContent = completion.content;\n\n            // 4. Create AI message record\n            await room.collection(MESSAGE_COLLECTION).create({\n                debate_id: debateId,\n                role: nextAiRole, // ai_1 or ai_2\n                content: aiResponseContent,\n                persona: nextAiPersona, // Store persona for display\n            });\n\n        } catch (err) {\n            console.error(\"Error sending message or getting AI response:\", err);\n            setError(\"An error occurred. Please try again.\");\n            // Optional: Re-add user message to input if sending failed critically\n            // setNewMessage(userMessageContent);\n        } finally {\n            setLoading(false);\n             // Refocus textarea after sending\n            textareaRef.current?.focus();\n            // Ensure textarea resizes correctly after clearing\n            requestAnimationFrame(() => {\n                 if (textareaRef.current) {\n                     textareaRef.current.style.height = 'auto';\n                 }\n            });\n        }\n    };\n\n    if (!currentDebate) {\n        // This might happen briefly if the debate is deleted while viewing\n        return <div className=\"loading\">Loading debate details...</div>;\n    }\n\n    // Reverse messages for display (oldest first)\n    const displayedMessages = [...messages].reverse();\n\n    return (\n        <div className=\"debate-interface\">\n            <h2>Debate: {currentDebate.topic}</h2>\n             <div className=\"debate-info\">\n                <p><strong>AI Persona 1:</strong> {currentDebate.aiPersona1}</p>\n                <p><strong>AI Persona 2:</strong> {currentDebate.aiPersona2}</p>\n            </div>\n            <div className=\"messages\">\n                {displayedMessages.length === 0 && !isLoading && (\n                    <p className=\"info-text\">The debate hasn't started yet. Send the first message!</p>\n                )}\n                {displayedMessages.map((msg) => (\n                    <Message key={msg.id} message={msg} debate={currentDebate} />\n                ))}\n                 {isLoading && displayedMessages.length > 0 && ( // Show spinner only when waiting for AI\n                    <div className=\"message ai loading-placeholder\">\n                         <div className=\"spinner\" style={{ margin: '0 auto' }}></div>\n                    </div>\n                )}\n                <div ref={messagesEndRef} />\n            </div>\n\n            <form className=\"message-form\" onSubmit={handleSendMessage}>\n                <textarea\n                    ref={textareaRef}\n                    className=\"message-input\"\n                    value={newMessage}\n                    onChange={(e) => setNewMessage(e.target.value)}\n                    placeholder=\"Your argument...\"\n                    rows=\"1\" // Start with one row, auto-expands\n                    disabled={isLoading}\n                    onKeyDown={(e) => {\n                         if (e.key === 'Enter' && !e.shiftKey) {\n                            e.preventDefault(); // Prevent newline on Enter\n                            handleSendMessage(e);\n                        }\n                     }}\n                />\n                <button type=\"submit\" className=\"send-button\" disabled={isLoading || !newMessage.trim()}>\n                    {isLoading ? 'Sending...' : 'Send'}\n                </button>\n            </form>\n             <div className=\"debate-actions\">\n                 <button onClick={onResetDebate} className=\"button reset-button\" disabled={isLoading}>\n                     End & Reset Debate\n                 </button>\n                 {/* Removed back button as reset now handles going back */}\n             </div>\n        </div>\n    );\n};\n\nconst Message = ({ message, debate }) => {\n    const { username, role, content, created_at, persona } = message;\n    const isUser = role === 'user';\n    const isAi1 = role === 'ai_1';\n    const isAi2 = role === 'ai_2';\n\n    let displayName = \"Unknown\";\n    let avatarUrl = \"https://images.websim.ai/default-avatar.png\"; // Default avatar\n    let messageClass = \"message\";\n\n    if (isUser) {\n        displayName = username || \"You\"; // Display current user's name or \"You\"\n        avatarUrl = `https://images.websim.ai/avatar/${username}`;\n        messageClass += \" user\";\n    } else if (isAi1) {\n        displayName = `AI 1 (${debate.aiPersona1.split(' ')[0]}...)`; // Short name from persona\n        avatarUrl = `https://api.dicebear.com/7.x/bottts/svg?seed=${encodeURIComponent(debate.aiPersona1)}`; // Deterministic avatar based on persona\n         messageClass += \" ai\";\n    } else if (isAi2) {\n        displayName = `AI 2 (${debate.aiPersona2.split(' ')[0]}...)`; // Short name from persona\n        avatarUrl = `https://api.dicebear.com/7.x/bottts/svg?seed=${encodeURIComponent(debate.aiPersona2)}&rotate=180`; // Different avatar style\n         messageClass += \" ai\";\n    }\n\n    const formatTimestamp = (timestamp) => {\n        try {\n            return DateTime.fromISO(timestamp).toLocaleString(DateTime.DATETIME_SHORT);\n        } catch (e) {\n            return \"Invalid date\";\n        }\n    };\n\n    return (\n        <div className={messageClass}>\n            <img src={avatarUrl} alt={`${displayName} avatar`} className=\"message-avatar\" />\n            <div className=\"message-content\">\n                <div className=\"message-header\">\n                    <span className=\"message-username\">{displayName}</span>\n                    <span className=\"message-timestamp\">{formatTimestamp(created_at)}</span>\n                </div>\n                 {/* Use ReactMarkdown to render content */}\n                <div className=\"message-text\">\n                    <ReactMarkdown>{content || ''}</ReactMarkdown>\n                </div>\n            </div>\n        </div>\n    );\n};\n\nReactDOM.render(<App />, document.getElementById('root'));\n\nconst { useState, useEffect, useRef, useSyncExternalStore, useMemo } = React;\nconst { DateTime } = luxon; // From global scope\nconst { ReactMarkdown } = window; // From global scope\n\n// Initialize WebsimSocket (assuming websim.js is loaded)\nconst room = new WebsimSocket();\n\n// --- Constants ---\nconst DEBATE_COLLECTION = 'debate_v1';\nconst MESSAGE_COLLECTION = 'message_v1';\nconst HISTORY_LIMIT = 10; // Max messages to send to LLM\n\n// --- Helper Functions ---\nconst formatTimestamp = (timestamp) => {\n    try {\n        return DateTime.fromISO(timestamp).toLocaleString(DateTime.DATETIME_SHORT);\n    } catch (e) {\n        console.error(\"Error formatting timestamp:\", e);\n        return \"Invalid date\";\n    }\n};\n\n// --- React Components ---\n\nconst App = () => {\n    const [currentDebateId, setCurrentDebateId] = useState(null);\n    const [loading, setLoading] = useState(false); // General loading state\n    const [error, setError] = useState(null);\n\n    // Subscribe to the list of debates (newest first)\n    // useSyncExternalStore requires stable function references for subscribe/getSnapshot\n    const subscribeDebates = useMemo(() => room.collection(DEBATE_COLLECTION).subscribe, []);\n    const getDebates = useMemo(() => room.collection(DEBATE_COLLECTION).getList, []);\n    const debates = useSyncExternalStore(subscribeDebates, getDebates, getDebates);\n\n    // Find the most recent *active* debate. We assume only one active debate for simplicity.\n    // If multiple debates are needed, a different UI (e.g., a list) would be required.\n    useEffect(() => {\n        const latestActiveDebate = debates.find(d => d.active !== false); // Find newest that isn't explicitly inactive\n        if (latestActiveDebate) {\n            setCurrentDebateId(latestActiveDebate.id);\n        } else {\n            setCurrentDebateId(null); // No active debate found\n        }\n    }, [debates]); // Re-run when the list of debates changes\n\n    const handleCreateDebate = async (topic, aiPersona1, aiPersona2) => {\n        setLoading(true);\n        setError(null);\n        try {\n             // Optional: Mark previous debates as inactive if desired\n            // for (const debate of debates) {\n            //     if (debate.active !== false && debate.username === room.presenceData.me.username) { // Only deactivate own debates\n            //        await room.collection(DEBATE_COLLECTION).update(debate.id, { active: false });\n            //     }\n            // }\n\n            const newDebate = await room.collection(DEBATE_COLLECTION).create({\n                topic,\n                aiPersona1,\n                aiPersona2,\n                active: true, // Mark the new debate as active\n            });\n            // State will update automatically via useSyncExternalStore finding the new active debate\n        } catch (err) {\n            console.error(\"Error creating debate:\", err);\n            setError(\"Failed to create debate. Please try again.\");\n        } finally {\n            setLoading(false);\n        }\n    };\n\n    const handleResetDebate = async () => {\n        if (!currentDebateId) return;\n        setLoading(true);\n        setError(null);\n        try {\n            // Mark the current debate as inactive instead of deleting\n            // Note: Only the user who created it can update it.\n            await room.collection(DEBATE_COLLECTION).update(currentDebateId, { active: false });\n            // setCurrentDebateId(null); // State will update via useSyncExternalStore finding no active debate\n        } catch (err) {\n            console.error(\"Error resetting debate (marking inactive):\", err);\n            // If update fails (e.g., not the owner), still reset local state to allow creating new one\n            setCurrentDebateId(null);\n            setError(\"Failed to mark debate as inactive. You might not be the creator. Resetting locally.\");\n        } finally {\n            setLoading(false);\n        }\n    };\n\n     const currentDebate = useMemo(() => debates.find(d => d.id === currentDebateId), [debates, currentDebateId]);\n\n    return (\n        <div className=\"container\">\n            <h1>AI Debate Club</h1>\n            {error && (\n                <div className=\"error\">\n                    Error: {error}\n                    <button onClick={() => setError(null)}>Dismiss</button>\n                </div>\n            )}\n            {loading && !currentDebateId && <div className=\"loading\"><div className=\"spinner\"></div></div>}\n\n            {!currentDebateId && !loading && (\n                 <DebateSetup onCreateDebate={handleCreateDebate} isLoading={loading} />\n             )}\n\n            {currentDebateId && currentDebate && (\n                <DebateInterface\n                    key={currentDebateId} // Force re-mount if ID changes\n                    debate={currentDebate}\n                    onResetDebate={handleResetDebate}\n                />\n            )}\n             {!currentDebateId && debates.length > 0 && !loading && (\n                <div className=\"info-text\">No active debate found. You can start a new one.</div>\n            )}\n        </div>\n    );\n};\n\nconst DebateSetup = ({ onCreateDebate, isLoading }) => {\n    const [topic, setTopic] = useState('');\n    const [aiPersona1, setAiPersona1] = useState('');\n    const [aiPersona2, setAiPersona2] = useState('');\n\n    const handleSubmit = (e) => {\n        e.preventDefault();\n        if (!topic.trim() || !aiPersona1.trim() || !aiPersona2.trim()) {\n            setError(\"Please fill in all fields.\");\n            return;\n        }\n        onCreateDebate(topic.trim(), aiPersona1.trim(), aiPersona2.trim());\n    };\n\n    return (\n        <div className=\"debate-setup\">\n            <h2>Start a New Debate</h2>\n            <form onSubmit={handleSubmit}>\n                <div className=\"form-group\">\n                    <label htmlFor=\"topic\">Debate Topic:</label>\n                    <input\n                        type=\"text\"\n                        id=\"topic\"\n                        value={topic}\n                        onChange={(e) => setTopic(e.target.value)}\n                        placeholder=\"e.g., Is remote work the future?\"\n                        required\n                        disabled={isLoading}\n                        maxLength={150}\n                    />\n                </div>\n                <div className=\"form-group\">\n                    <label htmlFor=\"aiPersona1\">AI Persona 1 (e.g., Proponent):</label>\n                    <textarea\n                        id=\"aiPersona1\"\n                        value={aiPersona1}\n                        onChange={(e) => setAiPersona1(e.target.value)}\n                        placeholder=\"e.g., A tech CEO advocating for full remote flexibility.\"\n                        required\n                        disabled={isLoading}\n                        maxLength={300}\n                        rows={3}\n                    />\n                </div>\n                <div className=\"form-group\">\n                    <label htmlFor=\"aiPersona2\">AI Persona 2 (e.g., Opponent):</label>\n                    <textarea\n                        id=\"aiPersona2\"\n                        value={aiPersona2}\n                        onChange={(e) => setAiPersona2(e.target.value)}\n                        placeholder=\"e.g., An office manager emphasizing the importance of in-person collaboration.\"\n                        required\n                        disabled={isLoading}\n                        maxLength={300}\n                        rows={3}\n                    />\n                </div>\n                <button type=\"submit\" className=\"button\" disabled={isLoading}>\n                    {isLoading ? 'Starting...' : 'Start Debate'}\n                </button>\n            </form>\n        </div>\n    );\n};\n\nconst DebateInterface = ({ debate, onResetDebate }) => {\n    const { id: debateId, topic, aiPersona1, aiPersona2 } = debate;\n    const [newMessage, setNewMessage] = useState('');\n    const [isAiResponding, setIsAiResponding] = useState(false);\n    const [localError, setLocalError] = useState(null);\n    const messagesEndRef = useRef(null);\n    const textareaRef = useRef(null);\n\n    // --- Message Subscription ---\n    // Filter object needs stable identity for useSyncExternalStore\n    const messageFilter = useMemo(() => ({ debate_id: debateId }), [debateId]);\n\n    // Memoize subscribe/getSnapshot functions based on the filter\n    const subscribeMessages = useMemo(() => {\n        // Important: Need to return a new function if filter changes.\n        // The filter itself is memoized, so this works.\n        return (callback) => room.collection(MESSAGE_COLLECTION).filter(messageFilter).subscribe(callback);\n    }, [messageFilter]);\n\n    const getMessagesSnapshot = useMemo(() => {\n         // Important: Need to return a new function if filter changes.\n        return () => room.collection(MESSAGE_COLLECTION).filter(messageFilter).getList();\n    }, [messageFilter]);\n\n    // Subscribe to messages for *this specific debate*\n    const messages = useSyncExternalStore(\n        subscribeMessages,\n        getMessagesSnapshot,\n        getMessagesSnapshot // Server snapshot (optional, can be same as client)\n    );\n    // --- End Message Subscription ---\n\n    // Scroll to bottom when new messages arrive\n    useEffect(() => {\n        messagesEndRef.current?.scrollIntoView({ behavior: \"smooth\" });\n    }, [messages]);\n\n    // Auto-resize textarea height based on content\n    useEffect(() => {\n        const textarea = textareaRef.current;\n        if (textarea) {\n            textarea.style.height = 'auto'; // Reset height to recalculate scrollHeight\n            const scrollHeight = textarea.scrollHeight;\n            textarea.style.height = `${scrollHeight}px`; // Set to new scroll height\n             // Apply max-height check from CSS\n            const maxHeight = parseInt(window.getComputedStyle(textarea).maxHeight, 10);\n            if (maxHeight && scrollHeight > maxHeight) {\n                textarea.style.overflowY = 'auto';\n            } else {\n                 textarea.style.overflowY = 'hidden';\n            }\n        }\n    }, [newMessage]); // Re-run when textarea content changes\n\n\n    const handleSendMessage = async (e) => {\n        if (e) e.preventDefault(); // Prevent default form submission if event exists\n        if (!newMessage.trim() || isAiResponding) return;\n\n        const userMessageContent = newMessage.trim();\n        setNewMessage(''); // Clear input immediately\n        setIsAiResponding(true);\n        setLocalError(null);\n\n        try {\n            // 1. Create user message record (Websim adds username automatically)\n            await room.collection(MESSAGE_COLLECTION).create({\n                debate_id: debateId,\n                role: 'user',\n                content: userMessageContent,\n            });\n\n            // 2. Get latest messages for LLM context (after user message is potentially added)\n            // Note: getList() might not *immediately* reflect the create, but it's usually fast enough.\n            // If issues arise, manually add the user message to the history passed to LLM.\n            const currentMessages = room.collection(MESSAGE_COLLECTION)\n                                     .filter({ debate_id: debateId })\n                                     .getList() // Get latest snapshot (newest first)\n                                     .slice(0, HISTORY_LIMIT) // Limit history size\n                                     .reverse(); // Reverse to oldest first for LLM\n\n             // Add user's message if getList didn't catch it yet (unlikely but safe)\n             const historyForLlm = [...currentMessages];\n             if (!historyForLlm.find(m => m.content === userMessageContent && m.role === 'user')) {\n                  historyForLlm.push({ role: 'user', content: userMessageContent });\n             }\n\n\n            // 3. Determine which AI responds\n            const lastMessage = currentMessages.length > 0 ? currentMessages[currentMessages.length - 1] : null;\n            // Simple alternation: if last wasn't ai_2, ai_1 goes (or starts). Otherwise ai_2 goes.\n            const nextAiRole = (!lastMessage || lastMessage.role === 'ai_2' || lastMessage.role === 'user') ? 'ai_1' : 'ai_2';\n            const nextAiPersona = nextAiRole === 'ai_1' ? aiPersona1 : aiPersona2;\n            const opponentPersona = nextAiRole === 'ai_1' ? aiPersona2 : aiPersona1;\n\n            // 4. Prepare LLM request\n            const systemPrompt = `You are in a debate on \"${topic}\". Your persona: \"${nextAiPersona}\". Your opponent: \"${opponentPersona}\". Respond concisely, in character, addressing previous points. Use Markdown for formatting.`;\n\n            const llmMessages = [\n                { role: \"system\", content: systemPrompt },\n                // Map db messages to {role, content} format\n                ...historyForLlm.map(msg => ({ role: msg.role, content: msg.content }))\n            ];\n\n            // 5. Call LLM\n            const completion = await websim.chat.completions.create({ messages: llmMessages });\n            const aiResponseContent = completion.content;\n\n            // 6. Create AI message record\n            if (aiResponseContent) {\n                await room.collection(MESSAGE_COLLECTION).create({\n                    debate_id: debateId,\n                    role: nextAiRole, // 'ai_1' or 'ai_2'\n                    content: aiResponseContent,\n                    persona: nextAiPersona, // Store persona for display clarity if needed\n                });\n            } else {\n                throw new Error(\"AI returned empty response.\");\n            }\n\n        } catch (err) {\n            console.error(\"Error during message send/AI response:\", err);\n            setLocalError(`An error occurred: ${err.message || 'Could not get AI response.'}. Please try again.`);\n            // Optional: Restore user message to input on critical failure\n            // setNewMessage(userMessageContent);\n        } finally {\n            setIsAiResponding(false);\n            // Refocus and resize textarea after response/error\n             requestAnimationFrame(() => {\n                textareaRef.current?.focus();\n                 if (textareaRef.current) {\n                     textareaRef.current.style.height = 'auto'; // Trigger resize post-render\n                     textareaRef.current.style.height = `${textareaRef.current.scrollHeight}px`;\n                 }\n            });\n        }\n    };\n\n    // Display messages oldest first\n    const displayedMessages = useMemo(() => [...messages].reverse(), [messages]);\n\n    return (\n        <div className=\"debate-interface\">\n            <h2>{topic}</h2>\n            <div className=\"debate-info\">\n                <p><strong>AI Persona 1:</strong> {aiPersona1}</p>\n                <p><strong>AI Persona 2:</strong> {aiPersona2}</p>\n            </div>\n             {localError && (\n                <div className=\"error\" style={{ margin: `0 0 ${'var(--spacing-md)'} 0` }}> {/* Use style for margin */}\n                    {localError}\n                    <button onClick={() => setLocalError(null)}>Dismiss</button>\n                </div>\n            )}\n            <div className=\"messages\">\n                {displayedMessages.length === 0 && !isAiResponding && (\n                    <p className=\"info-text\">The debate is ready. Send the first message!</p>\n                )}\n                {displayedMessages.map((msg) => (\n                    <Message key={msg.id} message={msg} debate={debate} />\n                ))}\n                 {isAiResponding && ( // Show placeholder while AI is typing\n                    <MessageLoadingPlaceholder role={ // Guess next role for placeholder\n                         (messages.length === 0 || messages[0].role === 'ai_2' || messages[0].role === 'user') ? 'ai_1' : 'ai_2'\n                    } debate={debate} />\n                )}\n                <div ref={messagesEndRef} /> {/* Anchor for scrolling */}\n            </div>\n\n            <form className=\"message-form\" onSubmit={handleSendMessage}>\n                <textarea\n                    ref={textareaRef}\n                    className=\"message-input\"\n                    value={newMessage}\n                    onChange={(e) => setNewMessage(e.target.value)}\n                    placeholder={isAiResponding ? \"AI is responding...\" : \"Your argument...\"}\n                    rows=\"1\" // Start as single line, expands via JS\n                    disabled={isAiResponding}\n                    onKeyDown={(e) => {\n                         // Send on Enter (not Shift+Enter)\n                         if (e.key === 'Enter' && !e.shiftKey) {\n                            e.preventDefault();\n                            handleSendMessage();\n                        }\n                     }}\n                />\n                <button type=\"submit\" className=\"send-button\" disabled={isAiResponding || !newMessage.trim()}>\n                    {isAiResponding ? <div className=\"spinner\" style={{ width: '20px', height: '20px', borderWidth: '2px', margin: '0 auto', borderLeftColor: 'white' }}></div> : 'Send'}\n                </button>\n            </form>\n             <div className=\"debate-actions\">\n                 <button onClick={onResetDebate} className=\"button reset-button\" disabled={isAiResponding}>\n                     End & Reset Debate\n                 </button>\n             </div>\n        </div>\n    );\n};\n\n// Represents a single message in the chat\nconst Message = ({ message, debate }) => {\n    const { username, role, content, created_at, persona } = message;\n    const isUser = role === 'user';\n    const isAi = role === 'ai_1' || role === 'ai_2';\n\n    let displayName = \"Unknown\";\n    let avatarUrl = `https://api.dicebear.com/7.x/initials/svg?seed=Unknown`; // Default fallback\n    let messageClass = \"message\";\n    let title = \"\"; // For tooltip/hover info\n\n    if (isUser) {\n        displayName = username || \"User\"; // Websim provides username\n        avatarUrl = `https://images.websim.ai/avatar/${username}`;\n        messageClass += \" user\";\n        title = `User: ${displayName}`;\n    } else if (isAi) {\n        const aiNum = role === 'ai_1' ? 1 : 2;\n        const aiPersona = role === 'ai_1' ? debate.aiPersona1 : debate.aiPersona2;\n         // Try to extract a short name, fallback to \"AI X\"\n        const shortPersona = aiPersona?.split(/[,.\\s]/)[0] || `AI ${aiNum}`;\n        displayName = `AI ${aiNum} (${shortPersona})`;\n        // Use DiceBear Bottts for distinct AI avatars, seeded by persona for consistency\n        avatarUrl = `https://api.dicebear.com/7.x/bottts/svg?seed=${encodeURIComponent(aiPersona || role)}&radius=50&backgroundColor=c0aede,bbf7d0,fecdd3,fef08a`; // Use persona as seed\n        messageClass += \" ai\";\n        title = `AI ${aiNum}: ${aiPersona || 'N/A'}`;\n    }\n\n    return (\n        <div className={messageClass} title={title}>\n            <img\n                src={avatarUrl}\n                alt={`${displayName} avatar`}\n                className=\"message-avatar\"\n                // Basic error fallback\n                onError={(e) => { e.target.src = `https://api.dicebear.com/7.x/initials/svg?seed=${displayName.charAt(0)}`; }}\n            />\n            <div className=\"message-content\">\n                <div className=\"message-header\">\n                    <span className=\"message-username\">{displayName}</span>\n                    <span className=\"message-timestamp\">{formatTimestamp(created_at)}</span>\n                </div>\n                 {/* Use ReactMarkdown, ensure content is a string */}\n                 <div className=\"message-text\">\n                    <ReactMarkdown>{String(content || '')}</ReactMarkdown>\n                 </div>\n            </div>\n        </div>\n    );\n};\n\n// Placeholder for when AI is responding\nconst MessageLoadingPlaceholder = ({ role, debate }) => {\n     const isAi1 = role === 'ai_1';\n     const persona = isAi1 ? debate.aiPersona1 : debate.aiPersona2;\n     const avatarUrl = `https://api.dicebear.com/7.x/bottts/svg?seed=${encodeURIComponent(persona || role)}&radius=50&backgroundColor=c0aede,bbf7d0,fecdd3,fef08a`;\n     const displayName = isAi1 ? `AI 1 (${persona?.split(/[,.\\s]/)[0] || 'AI 1'})` : `AI 2 (${persona?.split(/[,.\\s]/)[0] || 'AI 2'})`;\n\n     return (\n        <div className=\"message ai\">\n             <img src={avatarUrl} alt=\"AI avatar\" className=\"message-avatar\" />\n             <div className=\"message-content\">\n                 <div className=\"message-header\">\n                    <span className=\"message-username\">{displayName}</span>\n                    <span className=\"message-timestamp\">Responding...</span>\n                </div>\n                <div className=\"message-text\" style={{ display: 'flex', alignItems: 'center', height: '30px' }}>\n                    <div className=\"spinner\"></div>\n                </div>\n             </div>\n        </div>\n     );\n};\n\n\n// --- Render App ---\nconst root = ReactDOM.createRoot(document.getElementById('root'));\nroot.render(<App />);\n\n"}
+import { jsxDEV } from "react/jsx-dev-runtime";
+const { useState, useEffect, useRef, useSyncExternalStore, useMemo } = React;
+const { DateTime } = luxon;
+const ReactMarkdown = window.ReactMarkdown?.default || window.ReactMarkdown;
+const room = new WebsimSocket();
+const DEBATE_COLLECTION = "debate_v1";
+const MESSAGE_COLLECTION = "message_v1";
+const HISTORY_LIMIT = 10;
+const formatTimestamp = (timestamp) => {
+  try {
+    return DateTime.fromISO(timestamp).toLocaleString(DateTime.DATETIME_SHORT);
+  } catch (e) {
+    console.error("Error formatting timestamp:", e);
+    return "Invalid date";
+  }
+};
+const App = () => {
+  const [currentDebateId, setCurrentDebateId] = useState(null);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState(null);
+  const subscribeDebates = useMemo(() => room.collection(DEBATE_COLLECTION).subscribe, []);
+  const getDebates = useMemo(() => room.collection(DEBATE_COLLECTION).getList, []);
+  const debates = useSyncExternalStore(subscribeDebates, getDebates, getDebates);
+  useEffect(() => {
+    const latestActiveDebate = debates.find((d) => d.active !== false);
+    if (latestActiveDebate) {
+      setCurrentDebateId(latestActiveDebate.id);
+    } else {
+      setCurrentDebateId(null);
+    }
+  }, [debates]);
+  const handleCreateDebate = async (topic, aiPersona1, aiPersona2) => {
+    setLoading(true);
+    setError(null);
+    try {
+      const newDebate = await room.collection(DEBATE_COLLECTION).create({
+        topic,
+        aiPersona1,
+        aiPersona2,
+        active: true
+        // Mark the new debate as active
+      });
+    } catch (err) {
+      console.error("Error creating debate:", err);
+      setError("Failed to create debate. Please try again.");
+    } finally {
+      setLoading(false);
+    }
+  };
+  const handleResetDebate = async () => {
+    if (!currentDebateId) return;
+    setLoading(true);
+    setError(null);
+    try {
+      await room.collection(DEBATE_COLLECTION).update(currentDebateId, { active: false });
+    } catch (err) {
+      console.error("Error resetting debate (marking inactive):", err);
+      setCurrentDebateId(null);
+      setError("Failed to mark debate as inactive. You might not be the creator. Resetting locally.");
+    } finally {
+      setLoading(false);
+    }
+  };
+  const currentDebate = useMemo(() => debates.find((d) => d.id === currentDebateId), [debates, currentDebateId]);
+  return /* @__PURE__ */ jsxDEV("div", { className: "container", children: [
+    /* @__PURE__ */ jsxDEV("h1", { children: "AI Debate Club" }, void 0, false, {
+      fileName: "<stdin>",
+      lineNumber: 98,
+      columnNumber: 13
+    }),
+    error && /* @__PURE__ */ jsxDEV("div", { className: "error", children: [
+      "Error: ",
+      error,
+      /* @__PURE__ */ jsxDEV("button", { onClick: () => setError(null), children: "Dismiss" }, void 0, false, {
+        fileName: "<stdin>",
+        lineNumber: 102,
+        columnNumber: 21
+      })
+    ] }, void 0, true, {
+      fileName: "<stdin>",
+      lineNumber: 100,
+      columnNumber: 17
+    }),
+    loading && !currentDebateId && /* @__PURE__ */ jsxDEV("div", { className: "loading", children: /* @__PURE__ */ jsxDEV("div", { className: "spinner" }, void 0, false, {
+      fileName: "<stdin>",
+      lineNumber: 105,
+      columnNumber: 70
+    }) }, void 0, false, {
+      fileName: "<stdin>",
+      lineNumber: 105,
+      columnNumber: 45
+    }),
+    !currentDebateId && !loading && /* @__PURE__ */ jsxDEV(DebateSetup, { onCreateDebate: handleCreateDebate, isLoading: loading }, void 0, false, {
+      fileName: "<stdin>",
+      lineNumber: 108,
+      columnNumber: 18
+    }),
+    currentDebateId && currentDebate && /* @__PURE__ */ jsxDEV(
+      DebateInterface,
+      {
+        debate: currentDebate,
+        onResetDebate: handleResetDebate
+      },
+      currentDebateId,
+      false,
+      {
+        fileName: "<stdin>",
+        lineNumber: 112,
+        columnNumber: 17
+      }
+    ),
+    !currentDebateId && debates.length > 0 && !loading && /* @__PURE__ */ jsxDEV("div", { className: "info-text", children: "No active debate found. You can start a new one." }, void 0, false, {
+      fileName: "<stdin>",
+      lineNumber: 119,
+      columnNumber: 17
+    })
+  ] }, void 0, true, {
+    fileName: "<stdin>",
+    lineNumber: 97,
+    columnNumber: 9
+  });
+};
+const DebateSetup = ({ onCreateDebate, isLoading }) => {
+  const [topic, setTopic] = useState("");
+  const [aiPersona1, setAiPersona1] = useState("");
+  const [aiPersona2, setAiPersona2] = useState("");
+  const handleSubmit = (e) => {
+    e.preventDefault();
+    if (!topic.trim() || !aiPersona1.trim() || !aiPersona2.trim()) {
+      alert("Please fill in all fields.");
+      return;
+    }
+    onCreateDebate(topic.trim(), aiPersona1.trim(), aiPersona2.trim());
+  };
+  return /* @__PURE__ */ jsxDEV("div", { className: "debate-setup", children: [
+    /* @__PURE__ */ jsxDEV("h2", { children: "Start a New Debate" }, void 0, false, {
+      fileName: "<stdin>",
+      lineNumber: 141,
+      columnNumber: 13
+    }),
+    /* @__PURE__ */ jsxDEV("form", { onSubmit: handleSubmit, children: [
+      /* @__PURE__ */ jsxDEV("div", { className: "form-group", children: [
+        /* @__PURE__ */ jsxDEV("label", { htmlFor: "topic", children: "Debate Topic:" }, void 0, false, {
+          fileName: "<stdin>",
+          lineNumber: 144,
+          columnNumber: 21
+        }),
+        /* @__PURE__ */ jsxDEV(
+          "input",
+          {
+            type: "text",
+            id: "topic",
+            value: topic,
+            onChange: (e) => setTopic(e.target.value),
+            placeholder: "e.g., Is remote work the future?",
+            required: true,
+            disabled: isLoading,
+            maxLength: 150
+          },
+          void 0,
+          false,
+          {
+            fileName: "<stdin>",
+            lineNumber: 145,
+            columnNumber: 21
+          }
+        )
+      ] }, void 0, true, {
+        fileName: "<stdin>",
+        lineNumber: 143,
+        columnNumber: 17
+      }),
+      /* @__PURE__ */ jsxDEV("div", { className: "form-group", children: [
+        /* @__PURE__ */ jsxDEV("label", { htmlFor: "aiPersona1", children: "AI Persona 1 (e.g., Proponent):" }, void 0, false, {
+          fileName: "<stdin>",
+          lineNumber: 157,
+          columnNumber: 21
+        }),
+        /* @__PURE__ */ jsxDEV(
+          "textarea",
+          {
+            id: "aiPersona1",
+            value: aiPersona1,
+            onChange: (e) => setAiPersona1(e.target.value),
+            placeholder: "e.g., A tech CEO advocating for full remote flexibility.",
+            required: true,
+            disabled: isLoading,
+            maxLength: 300,
+            rows: 3
+          },
+          void 0,
+          false,
+          {
+            fileName: "<stdin>",
+            lineNumber: 158,
+            columnNumber: 21
+          }
+        )
+      ] }, void 0, true, {
+        fileName: "<stdin>",
+        lineNumber: 156,
+        columnNumber: 17
+      }),
+      /* @__PURE__ */ jsxDEV("div", { className: "form-group", children: [
+        /* @__PURE__ */ jsxDEV("label", { htmlFor: "aiPersona2", children: "AI Persona 2 (e.g., Opponent):" }, void 0, false, {
+          fileName: "<stdin>",
+          lineNumber: 170,
+          columnNumber: 21
+        }),
+        /* @__PURE__ */ jsxDEV(
+          "textarea",
+          {
+            id: "aiPersona2",
+            value: aiPersona2,
+            onChange: (e) => setAiPersona2(e.target.value),
+            placeholder: "e.g., An office manager emphasizing the importance of in-person collaboration.",
+            required: true,
+            disabled: isLoading,
+            maxLength: 300,
+            rows: 3
+          },
+          void 0,
+          false,
+          {
+            fileName: "<stdin>",
+            lineNumber: 171,
+            columnNumber: 21
+          }
+        )
+      ] }, void 0, true, {
+        fileName: "<stdin>",
+        lineNumber: 169,
+        columnNumber: 17
+      }),
+      /* @__PURE__ */ jsxDEV("button", { type: "submit", className: "button", disabled: isLoading, children: isLoading ? "Starting..." : "Start Debate" }, void 0, false, {
+        fileName: "<stdin>",
+        lineNumber: 182,
+        columnNumber: 17
+      })
+    ] }, void 0, true, {
+      fileName: "<stdin>",
+      lineNumber: 142,
+      columnNumber: 13
+    })
+  ] }, void 0, true, {
+    fileName: "<stdin>",
+    lineNumber: 140,
+    columnNumber: 9
+  });
+};
+const DebateInterface = ({ debate, onResetDebate }) => {
+  const { id: debateId, topic, aiPersona1, aiPersona2 } = debate;
+  const [newMessage, setNewMessage] = useState("");
+  const [isAiResponding, setIsAiResponding] = useState(false);
+  const [localError, setLocalError] = useState(null);
+  const messagesEndRef = useRef(null);
+  const textareaRef = useRef(null);
+  const messageFilter = useMemo(() => ({ debate_id: debateId }), [debateId]);
+  const subscribeMessages = useMemo(() => {
+    return (callback) => room.collection(MESSAGE_COLLECTION).filter(messageFilter).subscribe(callback);
+  }, [messageFilter]);
+  const getMessagesSnapshot = useMemo(() => {
+    return () => room.collection(MESSAGE_COLLECTION).filter(messageFilter).getList();
+  }, [messageFilter]);
+  const messages = useSyncExternalStore(
+    subscribeMessages,
+    getMessagesSnapshot,
+    getMessagesSnapshot
+    // Server snapshot (optional, can be same as client)
+  );
+  useEffect(() => {
+    messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
+  }, [messages]);
+  useEffect(() => {
+    const textarea = textareaRef.current;
+    if (textarea) {
+      textarea.style.height = "auto";
+      const scrollHeight = textarea.scrollHeight;
+      textarea.style.height = `${scrollHeight}px`;
+      const maxHeight = parseInt(window.getComputedStyle(textarea).maxHeight, 10);
+      if (maxHeight && scrollHeight > maxHeight) {
+        textarea.style.overflowY = "auto";
+      } else {
+        textarea.style.overflowY = "hidden";
+      }
+    }
+  }, [newMessage]);
+  const handleSendMessage = async (e) => {
+    if (e) e.preventDefault();
+    if (!newMessage.trim() || isAiResponding) return;
+    const userMessageContent = newMessage.trim();
+    setNewMessage("");
+    setIsAiResponding(true);
+    setLocalError(null);
+    try {
+      await room.collection(MESSAGE_COLLECTION).create({
+        debate_id: debateId,
+        role: "user",
+        content: userMessageContent
+      });
+      const currentMessages = room.collection(MESSAGE_COLLECTION).filter({ debate_id: debateId }).getList().slice(0, HISTORY_LIMIT).reverse();
+      const historyForLlm = [...currentMessages];
+      if (!historyForLlm.find((m) => m.content === userMessageContent && m.role === "user")) {
+        historyForLlm.push({ role: "user", content: userMessageContent });
+      }
+      const lastMessage = currentMessages.length > 0 ? currentMessages[currentMessages.length - 1] : null;
+      const nextAiRole = !lastMessage || lastMessage.role === "ai_2" || lastMessage.role === "user" ? "ai_1" : "ai_2";
+      const nextAiPersona = nextAiRole === "ai_1" ? aiPersona1 : aiPersona2;
+      const opponentPersona = nextAiRole === "ai_1" ? aiPersona2 : aiPersona1;
+      const systemPrompt = `You are in a debate on "${topic}". Your persona: "${nextAiPersona}". Your opponent: "${opponentPersona}". Respond concisely, in character, addressing previous points. Use Markdown for formatting.`;
+      const llmMessages = [
+        { role: "system", content: systemPrompt },
+        // Map db messages to {role, content} format
+        ...historyForLlm.map((msg) => ({ role: msg.role, content: msg.content }))
+      ];
+      const completion = await websim.chat.completions.create({ messages: llmMessages });
+      const aiResponseContent = completion.content;
+      if (aiResponseContent) {
+        await room.collection(MESSAGE_COLLECTION).create({
+          debate_id: debateId,
+          role: nextAiRole,
+          // 'ai_1' or 'ai_2'
+          content: aiResponseContent,
+          persona: nextAiPersona
+          // Store persona for display clarity if needed
+        });
+      } else {
+        throw new Error("AI returned empty response.");
+      }
+    } catch (err) {
+      console.error("Error during message send/AI response:", err);
+      setLocalError(`An error occurred: ${err.message || "Could not get AI response."}. Please try again.`);
+    } finally {
+      setIsAiResponding(false);
+      requestAnimationFrame(() => {
+        textareaRef.current?.focus();
+        if (textareaRef.current) {
+          textareaRef.current.style.height = "auto";
+          textareaRef.current.style.height = `${textareaRef.current.scrollHeight}px`;
+        }
+      });
+    }
+  };
+  const displayedMessages = useMemo(() => [...messages].reverse(), [messages]);
+  return /* @__PURE__ */ jsxDEV("div", { className: "debate-interface", children: [
+    /* @__PURE__ */ jsxDEV("h2", { children: topic }, void 0, false, {
+      fileName: "<stdin>",
+      lineNumber: 333,
+      columnNumber: 13
+    }),
+    /* @__PURE__ */ jsxDEV("div", { className: "debate-info", children: [
+      /* @__PURE__ */ jsxDEV("p", { children: [
+        /* @__PURE__ */ jsxDEV("strong", { children: "AI Persona 1:" }, void 0, false, {
+          fileName: "<stdin>",
+          lineNumber: 335,
+          columnNumber: 20
+        }),
+        " ",
+        aiPersona1
+      ] }, void 0, true, {
+        fileName: "<stdin>",
+        lineNumber: 335,
+        columnNumber: 17
+      }),
+      /* @__PURE__ */ jsxDEV("p", { children: [
+        /* @__PURE__ */ jsxDEV("strong", { children: "AI Persona 2:" }, void 0, false, {
+          fileName: "<stdin>",
+          lineNumber: 336,
+          columnNumber: 20
+        }),
+        " ",
+        aiPersona2
+      ] }, void 0, true, {
+        fileName: "<stdin>",
+        lineNumber: 336,
+        columnNumber: 17
+      })
+    ] }, void 0, true, {
+      fileName: "<stdin>",
+      lineNumber: 334,
+      columnNumber: 13
+    }),
+    localError && /* @__PURE__ */ jsxDEV("div", { className: "error", style: { margin: `0 0 ${"var(--spacing-md)"} 0` }, children: [
+      " ",
+      localError,
+      /* @__PURE__ */ jsxDEV("button", { onClick: () => setLocalError(null), children: "Dismiss" }, void 0, false, {
+        fileName: "<stdin>",
+        lineNumber: 341,
+        columnNumber: 21
+      })
+    ] }, void 0, true, {
+      fileName: "<stdin>",
+      lineNumber: 339,
+      columnNumber: 17
+    }),
+    /* @__PURE__ */ jsxDEV("div", { className: "messages", children: [
+      displayedMessages.length === 0 && !isAiResponding && /* @__PURE__ */ jsxDEV("p", { className: "info-text", children: "The debate is ready. Send the first message!" }, void 0, false, {
+        fileName: "<stdin>",
+        lineNumber: 346,
+        columnNumber: 21
+      }),
+      displayedMessages.map((msg) => /* @__PURE__ */ jsxDEV(Message, { message: msg, debate }, msg.id, false, {
+        fileName: "<stdin>",
+        lineNumber: 349,
+        columnNumber: 21
+      })),
+      isAiResponding && // Show placeholder while AI is typing
+      /* @__PURE__ */ jsxDEV(MessageLoadingPlaceholder, { role: (
+        // Guess next role for placeholder
+        messages.length === 0 || messages[0].role === "ai_2" || messages[0].role === "user" ? "ai_1" : "ai_2"
+      ), debate }, void 0, false, {
+        fileName: "<stdin>",
+        lineNumber: 352,
+        columnNumber: 21
+      }),
+      /* @__PURE__ */ jsxDEV("div", { ref: messagesEndRef }, void 0, false, {
+        fileName: "<stdin>",
+        lineNumber: 356,
+        columnNumber: 17
+      }),
+      " "
+    ] }, void 0, true, {
+      fileName: "<stdin>",
+      lineNumber: 344,
+      columnNumber: 13
+    }),
+    /* @__PURE__ */ jsxDEV("form", { className: "message-form", onSubmit: handleSendMessage, children: [
+      /* @__PURE__ */ jsxDEV(
+        "textarea",
+        {
+          ref: textareaRef,
+          className: "message-input",
+          value: newMessage,
+          onChange: (e) => setNewMessage(e.target.value),
+          placeholder: isAiResponding ? "AI is responding..." : "Your argument...",
+          rows: "1",
+          disabled: isAiResponding,
+          onKeyDown: (e) => {
+            if (e.key === "Enter" && !e.shiftKey) {
+              e.preventDefault();
+              handleSendMessage();
+            }
+          }
+        },
+        void 0,
+        false,
+        {
+          fileName: "<stdin>",
+          lineNumber: 360,
+          columnNumber: 17
+        }
+      ),
+      /* @__PURE__ */ jsxDEV("button", { type: "submit", className: "send-button", disabled: isAiResponding || !newMessage.trim(), children: isAiResponding ? /* @__PURE__ */ jsxDEV("div", { className: "spinner", style: { width: "20px", height: "20px", borderWidth: "2px", margin: "0 auto", borderLeftColor: "white" } }, void 0, false, {
+        fileName: "<stdin>",
+        lineNumber: 377,
+        columnNumber: 39
+      }) : "Send" }, void 0, false, {
+        fileName: "<stdin>",
+        lineNumber: 376,
+        columnNumber: 17
+      })
+    ] }, void 0, true, {
+      fileName: "<stdin>",
+      lineNumber: 359,
+      columnNumber: 13
+    }),
+    /* @__PURE__ */ jsxDEV("div", { className: "debate-actions", children: /* @__PURE__ */ jsxDEV("button", { onClick: onResetDebate, className: "button reset-button", disabled: isAiResponding, children: "End & Reset Debate" }, void 0, false, {
+      fileName: "<stdin>",
+      lineNumber: 381,
+      columnNumber: 18
+    }) }, void 0, false, {
+      fileName: "<stdin>",
+      lineNumber: 380,
+      columnNumber: 14
+    })
+  ] }, void 0, true, {
+    fileName: "<stdin>",
+    lineNumber: 332,
+    columnNumber: 9
+  });
+};
+const Message = ({ message, debate }) => {
+  const { username, role, content, created_at, persona } = message;
+  const isUser = role === "user";
+  const isAi = role === "ai_1" || role === "ai_2";
+  let displayName = "Unknown";
+  let avatarUrl = `https://api.dicebear.com/7.x/initials/svg?seed=Unknown`;
+  let messageClass = "message";
+  let title = "";
+  if (isUser) {
+    displayName = username || "User";
+    avatarUrl = `https://images.websim.ai/avatar/${username}`;
+    messageClass += " user";
+    title = `User: ${displayName}`;
+  } else if (isAi) {
+    const aiNum = role === "ai_1" ? 1 : 2;
+    const aiPersona = role === "ai_1" ? debate.aiPersona1 : debate.aiPersona2;
+    const shortPersona = aiPersona?.split(/[,.\s]/)[0] || `AI ${aiNum}`;
+    displayName = `AI ${aiNum} (${shortPersona})`;
+    avatarUrl = `https://api.dicebear.com/7.x/bottts/svg?seed=${encodeURIComponent(aiPersona || role)}&radius=50&backgroundColor=c0aede,bbf7d0,fecdd3,fef08a`;
+    messageClass += " ai";
+    title = `AI ${aiNum}: ${aiPersona || "N/A"}`;
+  }
+  return /* @__PURE__ */ jsxDEV("div", { className: messageClass, title, children: [
+    /* @__PURE__ */ jsxDEV(
+      "img",
+      {
+        src: avatarUrl,
+        alt: `${displayName} avatar`,
+        className: "message-avatar",
+        onError: (e) => {
+          e.target.src = `https://api.dicebear.com/7.x/initials/svg?seed=${displayName.charAt(0)}`;
+        }
+      },
+      void 0,
+      false,
+      {
+        fileName: "<stdin>",
+        lineNumber: 419,
+        columnNumber: 13
+      }
+    ),
+    /* @__PURE__ */ jsxDEV("div", { className: "message-content", children: [
+      /* @__PURE__ */ jsxDEV("div", { className: "message-header", children: [
+        /* @__PURE__ */ jsxDEV("span", { className: "message-username", children: displayName }, void 0, false, {
+          fileName: "<stdin>",
+          lineNumber: 428,
+          columnNumber: 21
+        }),
+        /* @__PURE__ */ jsxDEV("span", { className: "message-timestamp", children: formatTimestamp(created_at) }, void 0, false, {
+          fileName: "<stdin>",
+          lineNumber: 429,
+          columnNumber: 21
+        })
+      ] }, void 0, true, {
+        fileName: "<stdin>",
+        lineNumber: 427,
+        columnNumber: 17
+      }),
+      /* @__PURE__ */ jsxDEV("div", { className: "message-text", children: /* @__PURE__ */ jsxDEV(ReactMarkdown, { children: String(content || "") }, void 0, false, {
+        fileName: "<stdin>",
+        lineNumber: 433,
+        columnNumber: 21
+      }) }, void 0, false, {
+        fileName: "<stdin>",
+        lineNumber: 432,
+        columnNumber: 18
+      })
+    ] }, void 0, true, {
+      fileName: "<stdin>",
+      lineNumber: 426,
+      columnNumber: 13
+    })
+  ] }, void 0, true, {
+    fileName: "<stdin>",
+    lineNumber: 418,
+    columnNumber: 9
+  });
+};
+const MessageLoadingPlaceholder = ({ role, debate }) => {
+  const isAi1 = role === "ai_1";
+  const persona = isAi1 ? debate.aiPersona1 : debate.aiPersona2;
+  const avatarUrl = `https://api.dicebear.com/7.x/bottts/svg?seed=${encodeURIComponent(persona || role)}&radius=50&backgroundColor=c0aede,bbf7d0,fecdd3,fef08a`;
+  const displayName = isAi1 ? `AI 1 (${persona?.split(/[,.\s]/)[0] || "AI 1"})` : `AI 2 (${persona?.split(/[,.\s]/)[0] || "AI 2"})`;
+  return /* @__PURE__ */ jsxDEV("div", { className: "message ai", children: [
+    /* @__PURE__ */ jsxDEV("img", { src: avatarUrl, alt: "AI avatar", className: "message-avatar" }, void 0, false, {
+      fileName: "<stdin>",
+      lineNumber: 449,
+      columnNumber: 14
+    }),
+    /* @__PURE__ */ jsxDEV("div", { className: "message-content", children: [
+      /* @__PURE__ */ jsxDEV("div", { className: "message-header", children: [
+        /* @__PURE__ */ jsxDEV("span", { className: "message-username", children: displayName }, void 0, false, {
+          fileName: "<stdin>",
+          lineNumber: 452,
+          columnNumber: 21
+        }),
+        /* @__PURE__ */ jsxDEV("span", { className: "message-timestamp", children: "Responding..." }, void 0, false, {
+          fileName: "<stdin>",
+          lineNumber: 453,
+          columnNumber: 21
+        })
+      ] }, void 0, true, {
+        fileName: "<stdin>",
+        lineNumber: 451,
+        columnNumber: 18
+      }),
+      /* @__PURE__ */ jsxDEV("div", { className: "message-text", style: { display: "flex", alignItems: "center", height: "30px" }, children: /* @__PURE__ */ jsxDEV("div", { className: "spinner" }, void 0, false, {
+        fileName: "<stdin>",
+        lineNumber: 456,
+        columnNumber: 21
+      }) }, void 0, false, {
+        fileName: "<stdin>",
+        lineNumber: 455,
+        columnNumber: 17
+      })
+    ] }, void 0, true, {
+      fileName: "<stdin>",
+      lineNumber: 450,
+      columnNumber: 14
+    })
+  ] }, void 0, true, {
+    fileName: "<stdin>",
+    lineNumber: 448,
+    columnNumber: 9
+  });
+};
+const root = ReactDOM.createRoot(document.getElementById("root"));
+root.render(/* @__PURE__ */ jsxDEV(App, {}, void 0, false, {
+  fileName: "<stdin>",
+  lineNumber: 465,
+  columnNumber: 13
+}));
